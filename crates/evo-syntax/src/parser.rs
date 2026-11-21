@@ -26,7 +26,20 @@ pub(crate) struct Parser<'a> {
     /// Inside a loop that is itself inside the `always` block, so `break` and
     /// `continue` leave that loop, not the `always` block.
     loop_in_always: bool,
+    /// How many nested statements and expressions are open (see [`MAX_DEPTH`]).
+    depth: usize,
+    /// Set after a "nested too deep" error: the rest of that line is already in an
+    /// ERROR node, so the errors its enclosing constructs would add are dropped.
+    too_deep: bool,
 }
+
+/// The deepest nesting of blocks, brackets, and prefix operators the parser follows.
+///
+/// The parser is recursive, so nesting without a bound overflows the stack, and a
+/// stack overflow aborts the process: it can't be reported as a [`SyntaxError`].
+/// Past this depth the parser reports an error and skips the rest of the line.
+/// CPython draws the same line at 200 nested brackets.
+const MAX_DEPTH: usize = 256;
 
 const FITNESS_INPUTS: &[&str] = &["examples", "holdout", "benchmark", "simulate", "replay"];
 
@@ -53,6 +66,8 @@ impl<'a> Parser<'a> {
             no_units: false,
             in_always: false,
             loop_in_always: false,
+            depth: 0,
+            too_deep: false,
         }
     }
 
@@ -246,6 +261,9 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, message: impl Into<String>) {
+        if self.too_deep {
+            return;
+        }
         let at = self
             .nth_index(0)
             .map_or((self.src.len(), self.src.len()), |i| {
@@ -253,6 +271,40 @@ impl<'a> Parser<'a> {
             });
         self.errors
             .push(SyntaxError::new(message, range(at.0, at.1)));
+    }
+
+    /// Opens one nesting level; pair it with [`Self::leave`]. Returns false at
+    /// [`MAX_DEPTH`], after reporting the error once.
+    fn enter(&mut self) -> bool {
+        if self.depth < MAX_DEPTH {
+            self.depth += 1;
+            return true;
+        }
+        self.error(format!(
+            "nested more than {MAX_DEPTH} levels deep: split this into smaller named steps"
+        ));
+        self.too_deep = true;
+        false
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Runs `parse` one nesting level deeper. At [`MAX_DEPTH`] it instead wraps the
+    /// rest of the logical line in an ERROR node, so every enclosing construct sees
+    /// the line end. Every recursive cycle in expressions and types goes through here.
+    fn nested(&mut self, parse: fn(&mut Self)) {
+        if self.enter() {
+            parse(self);
+            self.leave();
+        } else {
+            self.start(ERROR);
+            while !self.at_line_end() {
+                self.bump();
+            }
+            self.finish();
+        }
     }
 
     /// Wraps the rest of the line, and any block indented under it, in an ERROR node.
@@ -287,19 +339,17 @@ impl<'a> Parser<'a> {
 
     /// Requires the end of a logical line; anything left over becomes an ERROR node.
     fn line_end(&mut self) {
-        if self.eat(NEWLINE) || self.at_any(&[EOF, DEDENT]) {
-            return;
-        }
-        if self.at(SEMICOLON) {
+        // A loop, not recursion: `a; b; c; …` can be arbitrarily long.
+        while self.at(SEMICOLON) {
             self.error("one statement per line: start a new line instead of `;`");
             self.start(ERROR);
             self.bump();
             self.finish();
-            if self.at_line_end() {
-                self.eat(NEWLINE);
-            } else {
-                self.simple_stmt_line();
+            if !self.at_line_end() {
+                self.simple_stmt();
             }
+        }
+        if self.eat(NEWLINE) || self.at_any(&[EOF, DEDENT]) {
             return;
         }
         self.error("expected end of line");
@@ -314,6 +364,19 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------ statements
 
     fn statement(&mut self) {
+        if !self.enter() {
+            self.start(ERROR);
+            self.skip_line_and_block();
+            self.finish();
+            return;
+        }
+        // Reset only now: a run of too-deep statements shares one error.
+        self.too_deep = false;
+        self.statement_inner();
+        self.leave();
+    }
+
+    fn statement_inner(&mut self) {
         let before = self.pos;
         let cp = self.checkpoint();
         let mut decorated = false;
@@ -555,6 +618,7 @@ impl<'a> Parser<'a> {
         if self.expect(NEWLINE, "a new line") && self.eat(INDENT) {
             while !self.at_any(&[DEDENT, EOF]) {
                 let before = self.pos;
+                self.too_deep = false;
                 clause(self);
                 if self.pos == before {
                     self.error_line(format!("expected {what}"));
@@ -890,6 +954,10 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------ types
 
     fn type_expr(&mut self) {
+        self.nested(Self::type_expr_inner);
+    }
+
+    fn type_expr_inner(&mut self) {
         let cp = self.checkpoint();
         self.type_atom();
         if self.at(PIPE) {
@@ -954,7 +1022,7 @@ impl<'a> Parser<'a> {
         if self.at(STAR) {
             self.start(STARRED_EXPR);
             self.bump();
-            self.pipe_expr();
+            self.nested(Self::pipe_expr);
             self.finish();
         } else {
             self.expression();
@@ -962,6 +1030,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn expression(&mut self) {
+        self.nested(Self::expression_inner);
+    }
+
+    fn expression_inner(&mut self) {
         if self.at(IDENT) && self.nth(1) == ARROW {
             self.start(LAMBDA);
             self.bump();
@@ -1039,7 +1111,7 @@ impl<'a> Parser<'a> {
             }
             self.start(PREFIX_EXPR);
             self.bump();
-            self.not_expr();
+            self.nested(Self::not_expr);
             self.finish();
         } else {
             self.comparison();
@@ -1133,7 +1205,7 @@ impl<'a> Parser<'a> {
         if self.at_any(&[MINUS, PLUS]) {
             self.start(PREFIX_EXPR);
             self.bump();
-            self.unary();
+            self.nested(Self::unary);
             self.finish();
         } else {
             self.power();
@@ -1147,7 +1219,7 @@ impl<'a> Parser<'a> {
             self.operator_hint();
             self.start_at(cp, BIN_EXPR);
             self.bump();
-            self.unary(); // right-associative: 2 ^ 3 ^ 2 == 2 ^ (3 ^ 2)
+            self.nested(Self::unary); // right-associative: 2 ^ 3 ^ 2 == 2 ^ (3 ^ 2)
             self.finish();
         }
     }
@@ -1225,7 +1297,7 @@ impl<'a> Parser<'a> {
                 self.start(ARG);
                 self.start(STARRED_EXPR);
                 self.bump();
-                self.pipe_expr();
+                self.nested(Self::pipe_expr);
                 self.finish();
                 keywords = true;
             } else {
@@ -1449,7 +1521,7 @@ impl<'a> Parser<'a> {
             if self.at(STAR2) {
                 self.start(STARRED_EXPR);
                 self.bump();
-                self.pipe_expr();
+                self.nested(Self::pipe_expr);
                 self.finish();
             } else {
                 let entry = self.checkpoint();
@@ -1485,7 +1557,7 @@ impl<'a> Parser<'a> {
     fn evolvable(&mut self) {
         self.start(EVOLVABLE);
         self.bump(); // ~
-        self.arith();
+        self.nested(Self::arith);
         if self.eat(IN_KW) {
             let saved = self.no_units;
             self.no_units = true;

@@ -76,6 +76,9 @@ impl Parse {
 }
 
 /// Parses an Evolve source file. Never fails: errors are reported in [`Parse::errors`].
+///
+/// Blocks, brackets, and prefix operators nested more than 256 levels deep are an
+/// error too, so no input can overflow the parser's stack.
 pub fn parse(src: &str) -> Parse {
     let mut errors = Vec::new();
     let tokens = lexer::lex(src, &mut errors);
@@ -300,6 +303,102 @@ mod tests {
             .map(|t| t.kind)
             .collect();
         assert_eq!(kinds, [SyntaxKind::IDENT, SyntaxKind::SUPERSCRIPT]);
+    }
+
+    /// Runs `f` on a thread with a 1 MiB stack, smaller than any default, so a parser
+    /// that recurses without a bound overflows here first.
+    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("the parser thread panicked");
+    }
+
+    #[test]
+    fn nesting_below_the_limit_parses_cleanly() {
+        on_small_stack(|| {
+            for (open, close) in [("(", ")"), ("[", "]"), ("f(", ")"), ("{1: ", "}")] {
+                let src = format!("x = {}1{}\n", open.repeat(200), close.repeat(200));
+                let found = messages(&src);
+                assert!(found.is_empty(), "{open}: {found:?}");
+            }
+            let blocks: String = (0..90)
+                .map(|i| format!("{}if x:\n", " ".repeat(i)))
+                .collect();
+            let src = format!("{blocks}{}pass\n", " ".repeat(90));
+            assert!(messages(&src).is_empty());
+        });
+    }
+
+    /// `parse` never fails, so unbounded nesting must end in a diagnostic, not in a
+    /// stack overflow that aborts the process.
+    #[test]
+    fn expressions_nested_past_the_limit_are_one_error() {
+        on_small_stack(|| {
+            for (head, open, close) in [
+                ("x = ", "(", ")"),
+                ("x = ", "[", "]"),
+                ("x = ", "f(", ")"),
+                ("x = ", "{1: ", "}"),
+                ("x = ", "-", ""),
+                ("x = ", "not ", ""),
+                ("x = ", "2 ^ ", ""),
+                ("x = ", "a -> ", ""),
+                ("x = ", "1 if c else ", ""),
+                ("x = ", "~", ""),
+                ("x = ", "[*", "]"),
+                ("x = ", "{**", "}"),
+                ("x = ", "f(**", ")"),
+                // type annotations nest too
+                ("x: ", "A[", "]"),
+                ("x: ", "(", ")"),
+            ] {
+                let src = format!(
+                    "{head}{}t{}\ny = 2\n",
+                    open.repeat(100_000),
+                    close.repeat(100_000)
+                );
+                let found = messages(&src);
+                assert_eq!(found.len(), 1, "{head}{open}: {} errors", found.len());
+                assert!(
+                    found[0].contains("nested more than"),
+                    "{head}{open}: {found:?}"
+                );
+                let last = parse(&src).syntax().children().last().map(|n| n.kind());
+                assert_eq!(
+                    last,
+                    Some(SyntaxKind::ASSIGN_STMT),
+                    "{head}{open}: recovery"
+                );
+            }
+        });
+    }
+
+    /// `a; b; c` is an error per `;`, but recovery must not recurse per statement.
+    #[test]
+    fn a_long_run_of_semicolons_is_parsed_iteratively() {
+        on_small_stack(|| {
+            let src = format!("{}\ny = 2\n", "x = 1; ".repeat(100_000));
+            assert_eq!(messages(&src).len(), 100_000);
+        });
+    }
+
+    #[test]
+    fn blocks_nested_past_the_limit_are_one_error() {
+        on_small_stack(|| {
+            let depth = 4096;
+            let blocks: String = (0..depth)
+                .map(|i| format!("{}if x:\n", " ".repeat(i)))
+                .collect();
+            let src = format!("{blocks}{}pass\ny = 2\n", " ".repeat(depth));
+            let found = messages(&src);
+            assert_eq!(found.len(), 1, "{} errors", found.len());
+            assert!(found[0].contains("nested more than"), "{found:?}");
+            let last = parse(&src).syntax().children().last().map(|n| n.kind());
+            assert_eq!(last, Some(SyntaxKind::ASSIGN_STMT), "recovery");
+        });
     }
 
     #[test]
