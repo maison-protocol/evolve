@@ -1443,8 +1443,15 @@ impl<'a> Parser<'a> {
         self.bump(); // {
         let mut kind = DICT_EXPR; // `{}` is an empty dict
         let mut first = true;
+        let mut mixed = false;
         while !self.at_any(&[R_BRACE, NEWLINE, EOF]) {
             let before = self.pos;
+            let entry_range = self
+                .nth_index(0)
+                .map_or(range(self.src.len(), self.src.len()), |i| {
+                    range(self.tokens[i].start, self.tokens[i].end)
+                });
+            let errors_before = self.errors.len();
             let mut entry_is_pair = true;
             if self.at(STAR2) {
                 self.start(STARRED_EXPR);
@@ -1470,6 +1477,19 @@ impl<'a> Parser<'a> {
                     kind = if entry_is_pair { DICT_COMP } else { SET_COMP };
                     break;
                 }
+            } else if entry_is_pair != (kind == DICT_EXPR)
+                && !mixed
+                && self.errors.len() == errors_before
+            {
+                // The first entry decides between dict and set (spec/grammar.ebnf `brace`).
+                // An entry that already has an error of its own gets no second one.
+                mixed = true;
+                let message = if kind == DICT_EXPR {
+                    "a dict entry is `key: value` or `**mapping`: this entry has no value"
+                } else {
+                    "a set entry is a single value: `key: value` and `**mapping` entries belong in a dict"
+                };
+                self.errors.push(SyntaxError::new(message, entry_range));
             }
             first = false;
             if self.pos == before || !self.eat(COMMA) {
