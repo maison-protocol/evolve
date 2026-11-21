@@ -1,0 +1,12 @@
+a = 0x
+b = 0b_
+c = 0O
+d = 0b102
+e = 0o78
+f = 0x_FF + 0b_1 + 0o_7
+
+# expect: 1:5: `0x` must be followed by a hex digit, as in `0xFF`
+# expect: 2:5: `0b` must be followed by a binary digit, as in `0b1010`
+# expect: 3:5: `0O` must be followed by an octal digit, as in `0o17`
+# expect: 4:9: `2` is not a binary digit: binary uses `0` and `1`
+# expect: 5:8: `8` is not an octal digit: octal uses `0` to `7`

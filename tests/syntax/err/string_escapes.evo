@@ -3,7 +3,13 @@ b = "\x4"
 c = b"café"
 d = r"\d+ is fine raw"
 e = re"\w+ is fine in a macro"
+f = "\N{EM DASH} and \N{HYPHEN-MINUS} are fine"
+g = "\N{}"
+h = "\N{DASH"
+i = "a later } does not close it"
 
 # expect: 1:8: unknown escape `\p`: write `\\p` for a backslash, or use a raw string `r"…"`
 # expect: 2:6: `\x` needs exactly 2 hex digits
 # expect: 3:10: bytes literals are ASCII only; write other bytes as `\xhh`
+# expect: 7:6: `\N` needs a character name: `\N{name}`
+# expect: 8:6: `\N` needs a character name: `\N{name}`

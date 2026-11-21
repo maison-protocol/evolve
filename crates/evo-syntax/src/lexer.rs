@@ -127,6 +127,16 @@ fn char_len(s: &str) -> usize {
     s.chars().next().map_or(0, char::len_utf8)
 }
 
+/// The byte length of the escape body after a backslash (`s` starts just after it).
+/// A CRLF line ending is one newline, so `\` before it escapes both bytes.
+fn escape_len(s: &str) -> usize {
+    if s.starts_with("\r\n") {
+        2
+    } else {
+        char_len(s)
+    }
+}
+
 /// How a string literal's body is checked.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StrMode {
@@ -147,6 +157,13 @@ pub(crate) fn raw_lex(src: &str, errors: &mut Vec<SyntaxError>) -> Vec<Token> {
                 u32::from(c)
             ),
             range(i, i + c.len_utf8()),
+        ));
+    }
+
+    for (i, _) in src.match_indices('\0') {
+        errors.push(SyntaxError::new(
+            "the NUL character is not allowed in source, even in strings and comments; inside a string write it as `\\0`",
+            range(i, i + 1),
         ));
     }
 
@@ -227,7 +244,7 @@ pub(crate) fn raw_lex(src: &str, errors: &mut Vec<SyntaxError>) -> Vec<Token> {
             _ => match PUNCT.iter().find(|(p, _)| rest.starts_with(p)) {
                 Some(&(p, kind)) => (kind, p.len()),
                 // already reported above; lexed as whitespace so parsing goes on undisturbed
-                None if is_bidi_control(c) => (WHITESPACE, c.len_utf8()),
+                None if is_bidi_control(c) || c == '\0' => (WHITESPACE, c.len_utf8()),
                 None => {
                     errors.push(SyntaxError::new(
                         format!("unexpected character {c:?}"),
@@ -273,7 +290,7 @@ fn lex_string(s: &str, offset: usize, mode: StrMode, errors: &mut Vec<SyntaxErro
             if mode != StrMode::Raw {
                 check_escape(escaped, offset + i, mode, errors);
             }
-            i += 1 + char_len(escaped);
+            i += 1 + escape_len(escaped);
         } else if rest.starts_with(delim) {
             return i + delim.len();
         } else if !multiline && (rest.starts_with('\n') || rest.starts_with('\r')) {
@@ -308,7 +325,7 @@ fn lex_fstring(s: &str, offset: usize, errors: &mut Vec<SyntaxError>) -> usize {
         if depth == 0 {
             if let Some(escaped) = rest.strip_prefix('\\') {
                 check_escape(escaped, offset + i, StrMode::Plain, errors);
-                i += 1 + char_len(escaped);
+                i += 1 + escape_len(escaped);
             } else if rest.starts_with(delim) {
                 return i + delim.len();
             } else if rest.starts_with("{{") || rest.starts_with("}}") {
@@ -342,6 +359,15 @@ fn lex_fstring(s: &str, offset: usize, errors: &mut Vec<SyntaxError>) -> usize {
     unterminated(s, offset, i, errors)
 }
 
+/// True when `s` starts with `{name}`. Unicode character names are made of ASCII
+/// letters, digits, spaces, and hyphens; whether the name exists is checked later.
+fn has_char_name(s: &str) -> bool {
+    s.strip_prefix('{').is_some_and(|rest| {
+        let name = take_while(rest, |c| c.is_ascii_alphanumeric() || c == ' ' || c == '-');
+        name > 0 && rest[name..].starts_with('}')
+    })
+}
+
 /// Checks the escape after a backslash (`s` starts just after it).
 fn check_escape(s: &str, offset: usize, mode: StrMode, errors: &mut Vec<SyntaxError>) {
     let hex = |n: usize| {
@@ -364,7 +390,7 @@ fn check_escape(s: &str, offset: usize, mode: StrMode, errors: &mut Vec<SyntaxEr
         'u' => Some("`\\u` needs exactly 4 hex digits".to_string()),
         'U' if hex(8) => None,
         'U' => Some("`\\U` needs exactly 8 hex digits".to_string()),
-        'N' if s[1..].starts_with('{') && s.contains('}') => None,
+        'N' if has_char_name(&s[1..]) => None,
         'N' => Some("`\\N` needs a character name: `\\N{name}`".to_string()),
         c => Some(format!(
             "unknown escape `\\{c}`: write `\\\\{c}` for a backslash, or use a raw string `r\"…\"`"
@@ -384,20 +410,36 @@ fn lex_number(s: &str, offset: usize, errors: &mut Vec<SyntaxError>) -> usize {
     let digits = |s: &str, radix: u32| take_while(s, |c| c == '_' || c.is_digit(radix));
     let mut segments: Vec<(usize, usize)> = Vec::new();
     let mut end = None;
-    for (prefix, radix) in [
-        ("0x", 16),
-        ("0X", 16),
-        ("0b", 2),
-        ("0B", 2),
-        ("0o", 8),
-        ("0O", 8),
+    for (prefix, radix, digit, digit_set, example) in [
+        ("0x", 16, "a hex", "", "0xFF"),
+        ("0X", 16, "a hex", "", "0xFF"),
+        ("0b", 2, "a binary", "binary uses `0` and `1`", "0b1010"),
+        ("0B", 2, "a binary", "binary uses `0` and `1`", "0b1010"),
+        ("0o", 8, "an octal", "octal uses `0` to `7`", "0o17"),
+        ("0O", 8, "an octal", "octal uses `0` to `7`", "0o17"),
     ] {
         if s.starts_with(prefix) {
             let n = digits(&s[2..], radix);
+            // Decimal digits the radix doesn't have (`0b102`, `0o78`) stay in the token,
+            // so they get one precise error instead of the number-then-letter hint.
+            let stray = take_while(&s[2 + n..], |c| c == '_' || c.is_ascii_digit());
+            let len = 2 + n + stray;
+            if stray > 0 {
+                let bad = &s[2 + n..2 + n + 1];
+                errors.push(SyntaxError::new(
+                    format!("`{bad}` is not {digit} digit: {digit_set}"),
+                    range(offset + 2 + n, offset + 2 + n + 1),
+                ));
+            } else if !s[2..len].contains(|c: char| c.is_digit(radix)) {
+                errors.push(SyntaxError::new(
+                    format!("`{prefix}` must be followed by {digit} digit, as in `{example}`"),
+                    range(offset, offset + len),
+                ));
+            }
             // one `_` may follow the prefix, as in Python: 0x_FF
             let first = 2 + usize::from(s[2..].starts_with('_'));
-            segments.push((first, 2 + n));
-            end = Some(2 + n);
+            segments.push((first, len));
+            end = Some(len);
             break;
         }
     }
