@@ -24,6 +24,16 @@ python3 bench/run.py bench/cases/0001-date-format-drift --program candidate.py  
 
 A case is **healed** when the candidate passes every holdout row and violates no invariant (exit code 0).
 
+A candidate that raises where a row expects a value, fails to import, or calls `sys.exit` fails that row or the run; it never sets the exit code itself. An invariant whose rule raises counts as violated.
+
+The scorer imports the candidate into the scorer's own process, so it is a reference for honest healers, not a sandbox: do not score programs you do not trust.
+
+The scorer has its own tests:
+
+```bash
+python3 -m unittest discover -s bench -p "test_*.py"
+```
+
 ## Rules for contributors
 
 - 🔒 **Anonymize everything.** No personal data, secrets, customer names, or proprietary code.

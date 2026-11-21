@@ -29,18 +29,24 @@ def to_json(value):
     return value
 
 
+# What a candidate may raise. SystemExit is included so that a program calling
+# `sys.exit(0)` fails its row instead of ending the scorer with a "healed" exit code.
+CANDIDATE_ERRORS = (Exception, SystemExit)
+
+
 def run_set(fn, path, result_invariants):
-    passed, rows = 0, [json.loads(line) for line in open(path) if line.strip()]
+    with open(path, encoding="utf-8") as f:
+        passed, rows = 0, [json.loads(line) for line in f if line.strip()]
     violations = []
     for row in rows:
         try:
             result = fn(row["input"])
-        except Exception as exc:  # a raised error is a valid outcome only when the row expects it
+        except CANDIDATE_ERRORS as exc:  # a raised error is a valid outcome only when the row expects it
             ok = type(exc).__name__ == row.get("raises")
         else:
             ok = "raises" not in row and to_json(result) == row.get("expected")
             for inv in result_invariants:
-                if not eval(inv["rule"], {"date": datetime.date, "result": result}):
+                if not _safe_eval(inv["rule"], {"date": datetime.date, "result": result}):
                     violations.append(f'{inv["name"]} on input {row["input"]!r}')
         passed += ok
     return passed, len(rows), violations
@@ -52,9 +58,14 @@ def main():
     ap.add_argument("--program", type=pathlib.Path, help="candidate program (default: the case's original)")
     args = ap.parse_args()
 
-    case = tomllib.loads((args.case / "case.toml").read_text())
+    case = tomllib.loads((args.case / "case.toml").read_text(encoding="utf-8"))
     gene = case["program"]["gene"]
-    fn = load_program(args.program or args.case / case["program"]["file"], gene)
+    try:
+        fn = load_program(args.program or args.case / case["program"]["file"], gene)
+    except CANDIDATE_ERRORS as exc:
+        print(f'case      {case["id"]}')
+        print(f"program   failed to load: {type(exc).__name__}: {exc}")
+        sys.exit(1)
 
     invariants = case.get("invariants", [])
     per_result = [i for i in invariants if "result" in i["rule"]]
@@ -73,9 +84,10 @@ def main():
 
 
 def _safe_eval(rule, ns):
+    """An invariant holds only when its rule evaluates to a true value; a rule that raises is violated."""
     try:
         return bool(eval(rule, ns))
-    except Exception:
+    except CANDIDATE_ERRORS:
         return False
 
 
