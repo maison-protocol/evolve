@@ -59,7 +59,7 @@ Track B  ───[ Parser + interpreter ]──[ Data-native core ]─┘
 | Core RFCs | 🌱 drafted: [0001](../rfcs/0001-syntax-core.md) Syntax core · [0002](../rfcs/0002-lesson-schema.md) Lesson schema · [0003](../rfcs/0003-gene-fitness-semantics.md) `gene`/`fitness` semantics · [0004](../rfcs/0004-promotion-and-safety.md) Promotion & safety model · [0005](../rfcs/0005-data-model.md) Data model. Next: comment period |
 | Grammar draft | 🌱 [Grammar revision 2](../spec/grammar.ebnf) (PEG notation, reviewed against the Python 3.16 reference) done; tree-sitter grammar for syntax highlighting still to do |
 | EvoBench v0 spec | 🌱 [Case format v0 and scorer](../bench/README.md) done; 1 of 50 cases (see [EvoBench](#4-evobench)) |
-| Project hygiene | ✅ Apache-2.0 license, ✅ Code of Conduct, ✅ CONTRIBUTING, CI skeleton |
+| Project hygiene | ✅ Apache-2.0 license, ✅ Code of Conduct, ✅ CONTRIBUTING, ✅ [CI](../.github/workflows/ci.yml) on beta and stable (nightly informational) |
 
 **Exit criteria:** the five core RFCs are accepted, and Lesson schema v0 is frozen for the engine to build on.
 

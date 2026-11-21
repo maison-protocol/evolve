@@ -1,0 +1,84 @@
+# The CI matrix from docs/roadmap.md ("Rust toolchain policy"):
+#   beta    required: the toolchain in rust-toolchain.toml
+#   stable  required: the code must also build on stable
+#   nightly informational: an early warning, never a gate
+# One more job checks the oldest toolchain Cargo.toml declares (`rust-version`).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [beta, stable, nightly]
+    env:
+      # Overrides the channel in rust-toolchain.toml for the stable and nightly jobs.
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the ${{ matrix.toolchain }} toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+          cargo --version
+          rustc --version
+
+      # Formatting is checked once, on the toolchain contributors use.
+      - name: cargo fmt
+        if: matrix.toolchain == 'beta'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Unit, corpus, round-trip, and doc-sample tests (RFC 0001 "Test plan").
+      - name: cargo test
+        run: cargo test --locked
+
+  # `rust-version` in Cargo.toml is a promise to anyone building with an older
+  # toolchain. Without this job nothing notices when the code stops keeping it.
+  msrv:
+    name: Rust (rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Read from Cargo.toml, so the job and the manifest cannot drift apart.
+      - name: Install the rust-version toolchain
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error file=Cargo.toml::expected exactly one rust-version line such as 1.85, found: '$version'"
+            exit 1
+          fi
+          rustup toolchain install "$version" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: cargo test
+        run: |
+          rustc --version
+          cargo test --locked
